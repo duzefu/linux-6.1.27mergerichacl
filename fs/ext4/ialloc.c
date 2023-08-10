@@ -30,6 +30,7 @@
 #include "ext4_jbd2.h"
 #include "xattr.h"
 #include "acl.h"
+#include "richacl.h"
 
 #include <trace/events/ext4.h>
 
@@ -910,6 +911,13 @@ static int ext4_xattr_credits_for_new_inode(struct inode *dir, mode_t mode,
 						    true /* is_create */);
 	return nblocks;
 }
+static inline int
+ext4_new_acl(handle_t *handle, struct inode *inode, struct inode *dir)
+{
+	if (IS_RICHACL(dir))
+		return ext4_init_richacl(handle, inode, dir);
+	return ext4_init_acl(handle, inode, dir);
+}
 
 /*
  * There are two policies for allocating an inode.  If the new inode is
@@ -1315,6 +1323,9 @@ got:
 		if (err)
 			goto fail_free_drop;
 	}
+	err = ext4_new_acl(handle, inode, dir);
+	if (err)
+		goto fail_free_drop;
 
 	if (!(ei->i_flags & EXT4_EA_INODE_FL)) {
 		err = ext4_init_acl(handle, inode, dir);

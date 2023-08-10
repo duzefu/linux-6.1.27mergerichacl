@@ -46,6 +46,7 @@
 
 #include <asm/byteorder.h>
 #include <uapi/linux/fs.h>
+#include <uapi/linux/mount.h>
 
 struct backing_dev_info;
 struct bdi_writeback;
@@ -101,6 +102,13 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
 #define MAY_CHDIR		0x00000040
 /* called from RCU mode, don't block */
 #define MAY_NOT_BLOCK		0x00000080
+#define MAY_CREATE_FILE		0x00000100
+#define MAY_CREATE_DIR		0x00000200
+#define MAY_DELETE_CHILD	0x00000400
+#define MAY_DELETE_SELF		0x00000800
+#define MAY_TAKE_OWNERSHIP	0x00001000
+#define MAY_CHMOD		0x00002000
+#define MAY_SET_TIMES		0x00004000
 
 /*
  * flags in file.f_mode.  Note that FMODE_READ and FMODE_WRITE must correspond
@@ -556,7 +564,12 @@ static inline void mapping_allow_writable(struct address_space *mapping)
 #define i_size_ordered_init(inode) do { } while (0)
 #endif
 
+struct base_acl {
+	atomic_t ba_refcount;
+	struct rcu_head ba_rcu;
+};
 struct posix_acl;
+struct richacl;
 #define ACL_NOT_CACHED ((void *)(-1))
 /*
  * ACL_DONT_CACHE is for stacked filesystems, that rely on underlying fs to
@@ -565,14 +578,14 @@ struct posix_acl;
  */
 #define ACL_DONT_CACHE ((void *)(-3))
 
-static inline struct posix_acl *
+static inline struct base_acl *
 uncached_acl_sentinel(struct task_struct *task)
 {
 	return (void *)task + 1;
 }
 
 static inline bool
-is_uncached_acl(struct posix_acl *acl)
+is_uncached_acl(struct base_acl *acl)
 {
 	return (long)acl & 1;
 }
@@ -597,9 +610,11 @@ struct inode {
 	kgid_t			i_gid;
 	unsigned int		i_flags;
 
-#ifdef CONFIG_FS_POSIX_ACL
-	struct posix_acl	*i_acl;
-	struct posix_acl	*i_default_acl;
+#if defined(CONFIG_FS_POSIX_ACL) || defined(CONFIG_FS_RICHACL)
+	struct base_acl		*i_acl;
+# if defined(CONFIG_FS_POSIX_ACL)
+	struct base_acl		*i_default_acl;
+# endif
 #endif
 
 	const struct inode_operations	*i_op;
@@ -2156,7 +2171,8 @@ struct inode_operations {
 	struct dentry * (*lookup) (struct inode *,struct dentry *, unsigned int);
 	const char * (*get_link) (struct dentry *, struct inode *, struct delayed_call *);
 	int (*permission) (struct user_namespace *, struct inode *, int);
-	struct posix_acl * (*get_acl)(struct inode *, int, bool);
+	struct posix_acl * (*get_acl)(struct inode *, int,bool);
+	struct richacl * (*get_richacl)(struct inode *);
 
 	int (*readlink) (struct dentry *, char __user *,int);
 
@@ -2188,6 +2204,7 @@ struct inode_operations {
 			struct file *, umode_t);
 	int (*set_acl)(struct user_namespace *, struct inode *,
 		       struct posix_acl *, int);
+	int (*set_richacl)(struct user_namespace *,struct inode *, struct richacl *);
 	int (*fileattr_set)(struct user_namespace *mnt_userns,
 			    struct dentry *dentry, struct fileattr *fa);
 	int (*fileattr_get)(struct dentry *dentry, struct fileattr *fa);
@@ -2327,6 +2344,12 @@ static inline bool sb_rdonly(const struct super_block *sb) { return sb->s_flags 
 #define IS_IMMUTABLE(inode)	((inode)->i_flags & S_IMMUTABLE)
 #define IS_POSIXACL(inode)	__IS_FLG(inode, SB_POSIXACL)
 
+#ifdef CONFIG_FS_RICHACL
+#define IS_RICHACL(inode)	__IS_FLG(inode, MS_RICHACL)
+#else
+#define IS_RICHACL(inode)	0
+#endif
+
 #define IS_DEADDIR(inode)	((inode)->i_flags & S_DEAD)
 #define IS_NOCMTIME(inode)	((inode)->i_flags & S_NOCMTIME)
 #define IS_SWAPFILE(inode)	((inode)->i_flags & S_SWAPFILE)
@@ -2368,6 +2391,12 @@ static inline void kiocb_clone(struct kiocb *kiocb, struct kiocb *kiocb_src,
 		.ki_pos = kiocb_src->ki_pos,
 	};
 }
+
+/*
+ * IS_ACL() tells the VFS to not apply the umask
+ * and use check_acl for acl permission checks when defined.
+ */
+#define IS_ACL(inode)		__IS_FLG(inode, MS_POSIXACL | MS_RICHACL)
 
 /*
  * Inode state bits.  Protected by inode->i_lock
@@ -3624,5 +3653,25 @@ extern int vfs_fadvise(struct file *file, loff_t offset, loff_t len,
 		       int advice);
 extern int generic_fadvise(struct file *file, loff_t offset, loff_t len,
 			   int advice);
+static inline void base_acl_get(struct base_acl *acl)
+{
+	if (acl)
+		atomic_inc(&acl->ba_refcount);
+}
+
+static inline void base_acl_put(struct base_acl *acl)
+{
+	if (acl && atomic_dec_and_test(&acl->ba_refcount))
+		kfree_rcu(acl, ba_rcu);
+}
+
+static inline void base_acl_init(struct base_acl *acl)
+{
+	atomic_set(&acl->ba_refcount, 1);
+}
+
+extern struct base_acl *__get_cached_acl(struct base_acl **);
+extern struct base_acl *__get_cached_acl_rcu(struct inode *,struct base_acl **,int );
+extern void __forget_cached_acl(struct base_acl **);
 
 #endif /* _LINUX_FS_H */

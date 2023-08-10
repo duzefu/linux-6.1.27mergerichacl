@@ -1740,6 +1740,27 @@ static const struct fs_parameter_spec ext4_param_specs[] = {
 	{}
 };
 
+static int enable_acl(struct super_block *sb)
+{
+	sb->s_flags &= ~(MS_POSIXACL | MS_RICHACL);
+	if (test_opt(sb, ACL)) {
+		if (ext4_has_feature_richacl(sb)) {
+#ifdef CONFIG_EXT4_FS_RICHACL
+			sb->s_flags |= MS_RICHACL;
+#else
+			return -EOPNOTSUPP;
+#endif
+		} else {
+#ifdef CONFIG_EXT4_FS_POSIX_ACL
+			sb->s_flags |= MS_POSIXACL;
+#else
+			return -EOPNOTSUPP;
+#endif
+		}
+	}
+	return 0;
+}
+
 #define DEFAULT_JOURNAL_IOPRIO (IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, 3))
 
 #define MOPT_SET	0x0001
@@ -1803,8 +1824,10 @@ static const struct mount_opts {
 	{Opt_journal_ioprio, 0, MOPT_NO_EXT2},
 	{Opt_data, 0, MOPT_NO_EXT2},
 	{Opt_user_xattr, EXT4_MOUNT_XATTR_USER, MOPT_SET},
-#ifdef CONFIG_EXT4_FS_POSIX_ACL
-	{Opt_acl, EXT4_MOUNT_POSIX_ACL, MOPT_SET},
+	// {Opt_nouser_xattr, EXT4_MOUNT_XATTR_USER, MOPT_CLEAR},
+#if defined(CONFIG_EXT4_FS_POSIX_ACL) || defined(CONFIG_EXT4_FS_RICHACL)
+	{Opt_acl, EXT4_MOUNT_ACL, MOPT_SET},
+	// {Opt_noacl, EXT4_MOUNT_ACL, MOPT_CLEAR},
 #else
 	{Opt_acl, 0, MOPT_NOSUPPORT},
 #endif
@@ -2094,6 +2117,14 @@ static int ext4_parse_param(struct fs_context *fc, struct fs_parameter *param)
 	}
 
 	switch (token) {
+	// case Opt_noacl:
+// #ifdef CONFIG_EXT4_FS_RICHACL
+// 	if (ext4_has_feature_richacl(sb)) {
+// 		ext4_msg(sb, KERN_ERR, "Mount option \"%s\" incompatible "
+// 			 "with richacl feature", opt);
+// 		return -1;
+// 	}
+// #endif
 #ifdef CONFIG_QUOTA
 	case Opt_usrjquota:
 		if (!*param->string)
@@ -4307,8 +4338,8 @@ static void ext4_set_def_opts(struct super_block *sb,
 		set_opt(sb, NO_UID32);
 	/* xattr user namespace & acls are now defaulted on */
 	set_opt(sb, XATTR_USER);
-#ifdef CONFIG_EXT4_FS_POSIX_ACL
-	set_opt(sb, POSIX_ACL);
+#if defined(CONFIG_EXT4_FS_POSIX_ACL) || defined(CONFIG_EXT4_FS_RICHACL)
+	set_opt(sb, ACL);
 #endif
 	if (ext4_has_feature_fast_commit(sb))
 		set_opt2(sb, JOURNAL_FAST_COMMIT);
@@ -5114,8 +5145,9 @@ static int __ext4_fill_super(struct fs_context *fc, struct super_block *sb)
 	if (ext4_journal_data_mode_check(sb))
 		goto failed_mount;
 
-	sb->s_flags = (sb->s_flags & ~SB_POSIXACL) |
-		(test_opt(sb, POSIX_ACL) ? SB_POSIXACL : 0);
+	err = enable_acl(sb);
+	if (err)
+		goto failed_mount;
 
 	/* i_version is always enabled now */
 	sb->s_flags |= SB_I_VERSION;
@@ -6419,8 +6451,9 @@ static int __ext4_remount(struct fs_context *fc, struct super_block *sb)
 	if (ext4_test_mount_flag(sb, EXT4_MF_FS_ABORTED))
 		ext4_abort(sb, ESHUTDOWN, "Abort forced by user");
 
-	sb->s_flags = (sb->s_flags & ~SB_POSIXACL) |
-		(test_opt(sb, POSIX_ACL) ? SB_POSIXACL : 0);
+	err = enable_acl(sb);
+	if (err)
+		goto restore_opts;
 
 	es = sbi->s_es;
 

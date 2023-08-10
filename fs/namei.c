@@ -36,6 +36,7 @@
 #include <linux/device_cgroup.h>
 #include <linux/fs_struct.h>
 #include <linux/posix_acl.h>
+#include <linux/richacl.h>
 #include <linux/hash.h>
 #include <linux/bitops.h>
 #include <linux/init_task.h>
@@ -291,16 +292,17 @@ static int check_acl(struct user_namespace *mnt_userns,
 		     struct inode *inode, int mask)
 {
 #ifdef CONFIG_FS_POSIX_ACL
+	struct base_acl *base_acl;
 	struct posix_acl *acl;
 
 	if (mask & MAY_NOT_BLOCK) {
-		acl = get_cached_acl_rcu(inode, ACL_TYPE_ACCESS);
-	        if (!acl)
+		base_acl = rcu_dereference(inode->i_acl);
+	        if (!base_acl)
 	                return -EAGAIN;
 		/* no ->get_acl() calls in RCU mode... */
-		if (is_uncached_acl(acl))
+		if (is_uncached_acl(base_acl))
 			return -ECHILD;
-	        return posix_acl_permission(mnt_userns, inode, acl, mask);
+	        return posix_acl_permission(mnt_userns, inode, posix_acl(base_acl), mask& ~MAY_NOT_BLOCK);
 	}
 
 	acl = get_acl(inode, ACL_TYPE_ACCESS);
@@ -331,6 +333,8 @@ static int check_acl(struct user_namespace *mnt_userns,
  * care to map the inode according to @mnt_userns before checking permissions.
  * On non-idmapped mounts or if permission checking is to be performed on the
  * raw inode simply passs init_user_ns.
+ *
+ * This does the basic permission checking
  */
 static int acl_permission_check(struct user_namespace *mnt_userns,
 				struct inode *inode, int mask)
@@ -345,6 +349,41 @@ static int acl_permission_check(struct user_namespace *mnt_userns,
 		mode >>= 6;
 		return (mask & ~mode) ? -EACCES : 0;
 	}
+	/*
+	 * With POSIX ACLs, the (mode & S_IRWXU) bits exactly match the owner
+	 * permissions, and we can skip checking posix acls for the owner.
+	 * With richacls, the owner may be granted fewer permissions than the
+	 * mode bits seem to suggest (for example, append but not write), and
+	 * we always need to check the richacl.
+	 */
+
+	if (IS_RICHACL(inode)) {
+		int error;
+
+		/*
+		 * The combination of MAY_DELETE_CHILD and MAY_DELETE_SELF
+		 * indicates that that we want to check for delete permission
+		 * in a directory assuming that we have MAY_DELETE_SELF access
+		 * on the victim.  We don't require MAY_DELETE_CHILD permission
+		 * on the directory, but we do require LSM permission, the
+		 * immutability checks, etc.
+		 */
+		if ((mask & MAY_DELETE_CHILD) && (mask & MAY_DELETE_SELF)) {
+			mask &= ~(MAY_DELETE_CHILD | MAY_DELETE_SELF);
+			if (!(mask & (MAY_CREATE_FILE | MAY_CREATE_DIR)))
+				mask &= ~MAY_WRITE;
+		}
+
+		error = check_richacl(mnt_userns,inode, mask);
+		if (error != -EAGAIN)
+			return error;
+		if (mask & (MAY_DELETE_SELF | MAY_TAKE_OWNERSHIP |
+			    MAY_CHMOD | MAY_SET_TIMES)) {
+			/* File permission bits cannot grant this. */
+			return -EACCES;
+		}
+	}
+
 
 	/* Do we have ACL's? */
 	if (IS_POSIXACL(inode) && (mode & S_IRWXG)) {
@@ -495,7 +534,9 @@ static int sb_permission(struct super_block *sb, struct inode *inode, int mask)
  * this, letting us set arbitrary permissions for filesystem access without
  * changing the "normal" UIDs which are used for other things.
  *
- * When checking for MAY_APPEND, MAY_WRITE must also be set in @mask.
+ * MAY_WRITE must be set in @mask whenever MAY_APPEND, MAY_CREATE_FILE,
+ * MAY_CREATE_DIR, or MAY_DELETE_CHILD are set.  That way, file systems that
+ * don't support these permissions will check for MAY_WRITE instead.
  */
 int inode_permission(struct user_namespace *mnt_userns,
 		     struct inode *inode, int mask)
@@ -2913,8 +2954,8 @@ EXPORT_SYMBOL(__check_sticky);
  * 11. We don't allow removal of NFS sillyrenamed files; it's handled by
  *     nfs_async_unlink().
  */
-static int may_delete(struct user_namespace *mnt_userns, struct inode *dir,
-		      struct dentry *victim, bool isdir)
+static int may_delete_or_replace(struct user_namespace *mnt_userns,struct inode *dir, struct dentry *victim,
+				 bool isdir, int mask)
 {
 	struct inode *inode = d_backing_inode(victim);
 	int error;
@@ -2932,15 +2973,20 @@ static int may_delete(struct user_namespace *mnt_userns, struct inode *dir,
 
 	audit_inode_child(dir, victim, AUDIT_TYPE_CHILD_DELETE);
 
-	error = inode_permission(mnt_userns, dir, MAY_WRITE | MAY_EXEC);
+	error = inode_permission(mnt_userns, dir, mask | MAY_DELETE_CHILD);
+	if (!error && check_sticky(mnt_userns,dir, inode))
+		error = -EPERM;
+	if (error && IS_RICHACL(inode) &&
+	    inode_permission(mnt_userns,inode, MAY_DELETE_SELF) == 0 &&
+	    inode_permission(mnt_userns,dir, mask | MAY_DELETE_CHILD | MAY_DELETE_SELF) == 0)
+		error = 0;
 	if (error)
 		return error;
 	if (IS_APPEND(dir))
 		return -EPERM;
 
-	if (check_sticky(mnt_userns, dir, inode) || IS_APPEND(inode) ||
-	    IS_IMMUTABLE(inode) || IS_SWAPFILE(inode) ||
-	    HAS_UNMAPPED_ID(mnt_userns, inode))
+	if (IS_APPEND(inode) || IS_IMMUTABLE(inode) ||
+	    IS_SWAPFILE(inode) || HAS_UNMAPPED_ID(mnt_userns, inode))
 		return -EPERM;
 	if (isdir) {
 		if (!d_is_dir(victim))
@@ -2956,6 +3002,20 @@ static int may_delete(struct user_namespace *mnt_userns, struct inode *dir,
 	return 0;
 }
 
+static int may_delete(struct user_namespace *mnt_userns,struct inode *dir, struct dentry *victim, bool isdir)
+{
+	return may_delete_or_replace(mnt_userns,dir, victim, isdir, MAY_WRITE | MAY_EXEC);
+}
+
+static int may_replace(struct user_namespace *mnt_userns,struct inode *dir, struct dentry *victim,
+		       bool isdir, bool new_isdir)
+{
+	int mask = new_isdir ? MAY_CREATE_DIR : MAY_CREATE_FILE;
+
+	return may_delete_or_replace(mnt_userns,dir, victim, isdir,
+				     mask | MAY_WRITE | MAY_EXEC);
+}
+
 /*	Check whether we can create an object with dentry child in directory
  *  dir.
  *  1. We can't do it if child already exists (open has special treatment for
@@ -2965,9 +3025,10 @@ static int may_delete(struct user_namespace *mnt_userns, struct inode *dir,
  *  4. We should have write and exec permissions on dir
  *  5. We can't do it if dir is immutable (done in permission())
  */
-static inline int may_create(struct user_namespace *mnt_userns,
-			     struct inode *dir, struct dentry *child)
+static inline int may_create(struct user_namespace *mnt_userns, struct inode *dir, struct dentry *child, bool isdir)
 {
+	int mask = isdir ? MAY_CREATE_DIR : MAY_CREATE_FILE;
+
 	audit_inode_child(dir, child, AUDIT_TYPE_CHILD_CREATE);
 	if (child->d_inode)
 		return -EEXIST;
@@ -2975,8 +3036,7 @@ static inline int may_create(struct user_namespace *mnt_userns,
 		return -ENOENT;
 	if (!fsuidgid_has_mapping(dir->i_sb, mnt_userns))
 		return -EOVERFLOW;
-
-	return inode_permission(mnt_userns, dir, MAY_WRITE | MAY_EXEC);
+	return inode_permission(mnt_userns, dir, MAY_WRITE | MAY_EXEC | mask);
 }
 
 /*
@@ -3037,7 +3097,7 @@ EXPORT_SYMBOL(unlock_rename);
  */
 static inline umode_t mode_strip_umask(const struct inode *dir, umode_t mode)
 {
-	if (!IS_POSIXACL(dir))
+	if (!IS_ACL(dir))
 		mode &= ~current_umask();
 	return mode;
 }
@@ -3101,7 +3161,7 @@ static inline umode_t vfs_prepare_mode(struct user_namespace *mnt_userns,
 int vfs_create(struct user_namespace *mnt_userns, struct inode *dir,
 	       struct dentry *dentry, umode_t mode, bool want_excl)
 {
-	int error = may_create(mnt_userns, dir, dentry);
+	int error = may_create(mnt_userns, dir, dentry, false);
 	if (error)
 		return error;
 
@@ -3124,7 +3184,8 @@ int vfs_mkobj(struct dentry *dentry, umode_t mode,
 		void *arg)
 {
 	struct inode *dir = dentry->d_parent->d_inode;
-	int error = may_create(&init_user_ns, dir, dentry);
+	bool is_dir = d_is_dir(dentry);		//i add it
+	int error = may_create(&init_user_ns, dir, dentry,is_dir);
 	if (error)
 		return error;
 
@@ -3891,7 +3952,7 @@ int vfs_mknod(struct user_namespace *mnt_userns, struct inode *dir,
 	      struct dentry *dentry, umode_t mode, dev_t dev)
 {
 	bool is_whiteout = S_ISCHR(mode) && dev == WHITEOUT_DEV;
-	int error = may_create(mnt_userns, dir, dentry);
+	int error = may_create(mnt_userns, dir, dentry,false);
 
 	if (error)
 		return error;
@@ -4016,7 +4077,7 @@ SYSCALL_DEFINE3(mknod, const char __user *, filename, umode_t, mode, unsigned, d
 int vfs_mkdir(struct user_namespace *mnt_userns, struct inode *dir,
 	      struct dentry *dentry, umode_t mode)
 {
-	int error = may_create(mnt_userns, dir, dentry);
+	int error = may_create(mnt_userns, dir, dentry,true);
 	unsigned max_links = dir->i_sb->s_max_links;
 
 	if (error)
@@ -4098,7 +4159,7 @@ SYSCALL_DEFINE2(mkdir, const char __user *, pathname, umode_t, mode)
 int vfs_rmdir(struct user_namespace *mnt_userns, struct inode *dir,
 		     struct dentry *dentry)
 {
-	int error = may_delete(mnt_userns, dir, dentry, 1);
+	int error = may_delete(mnt_userns, dir, dentry, true);
 
 	if (error)
 		return error;
@@ -4230,7 +4291,7 @@ int vfs_unlink(struct user_namespace *mnt_userns, struct inode *dir,
 	       struct dentry *dentry, struct inode **delegated_inode)
 {
 	struct inode *target = dentry->d_inode;
-	int error = may_delete(mnt_userns, dir, dentry, 0);
+	int error = may_delete(mnt_userns, dir, dentry, false);
 
 	if (error)
 		return error;
@@ -4386,7 +4447,7 @@ SYSCALL_DEFINE1(unlink, const char __user *, pathname)
 int vfs_symlink(struct user_namespace *mnt_userns, struct inode *dir,
 		struct dentry *dentry, const char *oldname)
 {
-	int error = may_create(mnt_userns, dir, dentry);
+	int error = may_create(mnt_userns, dir, dentry,false);
 
 	if (error)
 		return error;
@@ -4489,7 +4550,7 @@ int vfs_link(struct dentry *old_dentry, struct user_namespace *mnt_userns,
 	if (!inode)
 		return -ENOENT;
 
-	error = may_create(mnt_userns, dir, new_dentry);
+	error = may_create(mnt_userns, dir, new_dentry,false);
 	if (error)
 		return error;
 
@@ -4697,21 +4758,25 @@ int vfs_rename(struct renamedata *rd)
 	if (source == target)
 		return 0;
 
-	error = may_delete(rd->old_mnt_userns, old_dir, old_dentry, is_dir);
-	if (error)
-		return error;
-
 	if (!target) {
-		error = may_create(rd->new_mnt_userns, new_dir, new_dentry);
+		error = may_delete(rd->old_mnt_userns,old_dir, old_dentry, is_dir);
+		if (error)
+			return error;
+		error = may_create(rd->new_mnt_userns,new_dir, new_dentry, is_dir);
 	} else {
 		new_is_dir = d_is_dir(new_dentry);
 
-		if (!(flags & RENAME_EXCHANGE))
-			error = may_delete(rd->new_mnt_userns, new_dir,
-					   new_dentry, is_dir);
-		else
-			error = may_delete(rd->new_mnt_userns, new_dir,
-					   new_dentry, new_is_dir);
+		if (!(flags & RENAME_EXCHANGE)) {
+			error = may_delete(rd->old_mnt_userns,old_dir, old_dentry, is_dir);
+			if (error)
+				return error;
+			error = may_replace(rd->new_mnt_userns,new_dir, new_dentry, is_dir, is_dir);
+		} else {
+			error = may_replace(rd->old_mnt_userns,old_dir, old_dentry, is_dir, new_is_dir);
+			if (error)
+				return error;
+			error = may_replace(rd->new_mnt_userns,new_dir, new_dentry, new_is_dir, is_dir);
+		}
 	}
 	if (error)
 		return error;
@@ -4976,6 +5041,20 @@ SYSCALL_DEFINE2(rename, const char __user *, oldname, const char __user *, newna
 	return do_renameat2(AT_FDCWD, getname(oldname), AT_FDCWD,
 				getname(newname), 0);
 }
+
+//int vfs_whiteout(struct inode *dir, struct dentry *dentry)
+//{
+//	int error = may_create(dir, dentry, false);
+//	if (error)
+//		return error;
+//
+//	if (!dir->i_op->mknod)
+//		return -EPERM;
+//
+//	return dir->i_op->mknod(dir, dentry,
+//				S_IFCHR | WHITEOUT_MODE, WHITEOUT_DEV);
+//}
+//EXPORT_SYMBOL(vfs_whiteout);
 
 int readlink_copy(char __user *buffer, int buflen, const char *link)
 {

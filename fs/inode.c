@@ -22,6 +22,8 @@
 #include <linux/iversion.h>
 #include <trace/events/writeback.h>
 #include "internal.h"
+#include <linux/posix_acl.h>
+#include <linux/namei.h>
 
 /*
  * Inode locking rules:
@@ -218,8 +220,11 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 	inode->i_private = NULL;
 	inode->i_mapping = mapping;
 	INIT_HLIST_HEAD(&inode->i_dentry);	/* buggered by rcu freeing */
-#ifdef CONFIG_FS_POSIX_ACL
-	inode->i_acl = inode->i_default_acl = ACL_NOT_CACHED;
+#if defined(CONFIG_FS_POSIX_ACL) || defined(CONFIG_FS_RICHACL)
+	inode->i_acl = ACL_NOT_CACHED;
+# if defined(CONFIG_FS_POSIX_ACL)
+	inode->i_default_acl = ACL_NOT_CACHED;
+# endif
 #endif
 
 #ifdef CONFIG_FSNOTIFY
@@ -289,15 +294,74 @@ void __destroy_inode(struct inode *inode)
 		atomic_long_dec(&inode->i_sb->s_remove_count);
 	}
 
-#ifdef CONFIG_FS_POSIX_ACL
+#if defined(CONFIG_FS_POSIX_ACL) || defined(CONFIG_FS_RICHACL)
 	if (inode->i_acl && !is_uncached_acl(inode->i_acl))
-		posix_acl_release(inode->i_acl);
+		base_acl_put(inode->i_acl);
+# if defined(CONFIG_FS_POSIX_ACL)
 	if (inode->i_default_acl && !is_uncached_acl(inode->i_default_acl))
-		posix_acl_release(inode->i_default_acl);
+		base_acl_put(inode->i_default_acl);
+# endif
 #endif
 	this_cpu_dec(nr_inodes);
 }
 EXPORT_SYMBOL(__destroy_inode);
+
+#if defined(CONFIG_FS_POSIX_ACL) || defined(CONFIG_FS_RICHACL)
+struct base_acl *__get_cached_acl(struct base_acl **p)
+{
+	struct base_acl *base_acl;
+
+	for (;;) {
+		rcu_read_lock();
+		base_acl = rcu_dereference(*p);
+		if (!base_acl || is_uncached_acl(base_acl) ||
+		    atomic_inc_not_zero(&base_acl->ba_refcount))
+			break;
+		rcu_read_unlock();
+		cpu_relax();
+	}
+	rcu_read_unlock();
+	return base_acl;
+}
+
+static inline struct base_acl **acl_by_type(struct inode *inode, int type)
+{
+	switch (type) {
+	case ACL_TYPE_ACCESS:
+		return &inode->i_acl;
+	case ACL_TYPE_DEFAULT:
+		return &inode->i_default_acl;
+	default:
+		BUG();
+	}
+}
+
+struct base_acl *__get_cached_acl_rcu(struct inode *inode,struct base_acl **p,int type)
+{
+	struct base_acl *acl = rcu_dereference(*p);
+
+	if (acl == ACL_DONT_CACHE) {
+		struct posix_acl *ret;
+
+		ret = inode->i_op->get_acl(inode, type, LOOKUP_RCU);
+		if (!IS_ERR(ret))
+			acl = &(ret->a_base);
+	}
+
+	return acl;
+
+}
+
+
+void __forget_cached_acl(struct base_acl **p)
+{
+	struct base_acl *old;
+
+	old = xchg(p, ACL_NOT_CACHED);
+	if (!is_uncached_acl(old))
+		base_acl_put(old);
+}
+#endif
 
 static void destroy_inode(struct inode *inode)
 {

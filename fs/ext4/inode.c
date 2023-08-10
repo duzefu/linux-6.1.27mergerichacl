@@ -41,10 +41,10 @@
 #include <linux/bitops.h>
 #include <linux/iomap.h>
 #include <linux/iversion.h>
+#include <linux/acl.h>
 
 #include "ext4_jbd2.h"
 #include "xattr.h"
-#include "acl.h"
 #include "truncate.h"
 
 #include <trace/events/ext4.h>
@@ -5575,7 +5575,7 @@ out_mmap_sem:
 		ext4_orphan_del(NULL, inode);
 
 	if (!error && (ia_valid & ATTR_MODE))
-		rc = posix_acl_chmod(mnt_userns, inode, inode->i_mode);
+		rc = acl_chmod(mnt_userns, inode);
 
 err_out:
 	if  (error)

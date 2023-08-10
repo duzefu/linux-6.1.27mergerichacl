@@ -297,13 +297,15 @@ int jffs2_init_acl_post(struct inode *inode)
 	int rc;
 
 	if (inode->i_default_acl) {
-		rc = __jffs2_set_acl(inode, JFFS2_XPREFIX_ACL_DEFAULT, inode->i_default_acl);
+		rc = __jffs2_set_acl(inode, JFFS2_XPREFIX_ACL_DEFAULT,
+				     posix_acl(inode->i_default_acl));
 		if (rc)
 			return rc;
 	}
 
 	if (inode->i_acl) {
-		rc = __jffs2_set_acl(inode, JFFS2_XPREFIX_ACL_ACCESS, inode->i_acl);
+		rc = __jffs2_set_acl(inode, JFFS2_XPREFIX_ACL_ACCESS,
+				     posix_acl(inode->i_acl));
 		if (rc)
 			return rc;
 	}

@@ -512,7 +512,7 @@ struct posix_acl *ovl_get_acl(struct inode *inode, int type, bool rcu)
 	}
 
 	if (rcu) {
-		acl = get_cached_acl_rcu(realinode, type);
+		acl = posix_acl(get_cached_acl_rcu(realinode, type));
 	} else {
 		const struct cred *old_cred;
 

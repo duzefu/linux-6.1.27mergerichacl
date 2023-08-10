@@ -79,14 +79,14 @@ int v9fs_get_acl(struct inode *inode, struct p9_fid *fid)
 
 static struct posix_acl *v9fs_get_cached_acl(struct inode *inode, int type)
 {
-	struct posix_acl *acl;
+	struct base_acl *base_acl;
 	/*
 	 * 9p Always cache the acl value when
 	 * instantiating the inode (v9fs_inode_from_fid)
 	 */
-	acl = get_cached_acl(inode, type);
-	BUG_ON(is_uncached_acl(acl));
-	return acl;
+	base_acl = get_cached_acl(inode, type);
+	BUG_ON(is_uncached_acl(base_acl));
+	return posix_acl(base_acl);
 }
 
 struct posix_acl *v9fs_iop_get_acl(struct inode *inode, int type, bool rcu)
