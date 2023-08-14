@@ -1323,12 +1323,9 @@ got:
 		if (err)
 			goto fail_free_drop;
 	}
-	err = ext4_new_acl(handle, inode, dir);
-	if (err)
-		goto fail_free_drop;
 
 	if (!(ei->i_flags & EXT4_EA_INODE_FL)) {
-		err = ext4_init_acl(handle, inode, dir);
+		err = ext4_new_acl(handle, inode, dir);
 		if (err)
 			goto fail_free_drop;
 
