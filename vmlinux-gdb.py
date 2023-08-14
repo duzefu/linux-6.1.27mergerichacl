@@ -1,0 +1,1 @@
+/home/minmie/ugreen/linux-stable/scripts/gdb/vmlinux-gdb.py
