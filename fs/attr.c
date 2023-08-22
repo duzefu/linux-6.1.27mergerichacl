@@ -114,7 +114,7 @@ static bool chown_ok(struct user_namespace *mnt_userns,
 	if (vfsuid_eq_kuid(vfsuid, current_fsuid()) &&
 	    vfsuid_eq(ia_vfsuid, vfsuid))
 		return true;
-	if (vfsuid_eq_kuid(vfsuid, current_fsuid()) &&
+	if (vfsuid_eq_kuid(ia_vfsuid, current_fsuid()) &&
 	    inode_extended_permission(mnt_userns,inode, MAY_TAKE_OWNERSHIP) == 0)
 		return true;
 	if (capable_wrt_inode_uidgid(mnt_userns, inode, CAP_CHOWN))
