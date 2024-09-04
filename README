@@ -1,3 +1,6 @@
+linux 6.1.27 with richacl on ext4
+you should build with nfs/xfs/btrfs disable because I don't finished work on these file system
+
 Linux kernel
 ============
 
